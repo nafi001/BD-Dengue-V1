@@ -1,6 +1,7 @@
 """
 Production Inference Engine for Bangladesh Dengue Multi-Horizon Forecasting & Outbreak Detection.
-Uses frozen pooled_lgb_gjr_garch (h01..h14) + coherent Bottom-Up National reconciliation.
+Uses frozen pooled_lgb_gjr_garch (h01..h14) with level-stabilized GJR-GARCH intervals
++ coherent Bottom-Up National reconciliation.
 """
 from pathlib import Path
 import numpy as np
@@ -86,7 +87,6 @@ def extract_latest_origin_features(div_df: pd.DataFrame) -> tuple:
     df = div_df.copy()
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
-    # Use tail 450 days for fast inference while supporting 60d lags + 300d causal anomaly
     df = df.tail(450).reset_index(drop=True)
 
     full_range = pd.date_range(df["Date"].min(), df["Date"].max(), freq="D")
@@ -202,15 +202,23 @@ def extract_latest_origin_features(div_df: pd.DataFrame) -> tuple:
             feats[fc] = df[fc]
     feats["Urban_LST_Day_cloud_outlier_flag"] = lst_flag
 
+    # Causal recent 28-day empirical 7-day log-change volatility for interval anchoring
+    recent_diff7 = (ln_y - ln_y.shift(7)).tail(28).dropna()
+    recent_log_vol = float(np.std(recent_diff7, ddof=1)) if len(recent_diff7) >= 7 else 0.25
+
     last_i = len(df) - 1
     origin_date = pd.Timestamp(df.loc[last_i, "Date"])
     orig_dict = {k: float(v.iloc[last_i]) if pd.notna(v.iloc[last_i]) else 0.0 for k, v in feats.items()}
     y_log_map = dict(zip(df["Date"], ln_y.values.astype(float)))
-    return origin_date, orig_dict, y_log_map
+    return origin_date, orig_dict, y_log_map, recent_log_vol
 
 
 def forecast_all_divisions_and_national(history_df: pd.DataFrame, artifacts_dir: Path) -> pd.DataFrame:
-    """Generate 1–14d probabilistic forecasts for all 8 divisions + coherent Bottom-Up National."""
+    """
+    Generate 1–14d probabilistic forecasts for all 8 divisions + coherent Bottom-Up National.
+    Applies count-level variance stabilization to GJR-GARCH log volatility so upper bounds
+    remain epidemiologically realistic without exponential blow-up.
+    """
     artifacts_dir = Path(artifacts_dir)
     R_train = np.load(artifacts_dir / "cross_div_corr_R_train.npy")
 
@@ -228,7 +236,7 @@ def forecast_all_divisions_and_national(history_df: pd.DataFrame, artifacts_dir:
 
         h_div_preds = {}
         for div in DIVISIONS:
-            orig_dt, orig_feats, y_log_map = div_origin_cache[div]
+            orig_dt, orig_feats, y_log_map, recent_vol = div_origin_cache[div]
             targ_dt = orig_dt + pd.Timedelta(days=h)
             cal_row = build_calendar_row(targ_dt)
 
@@ -245,13 +253,24 @@ def forecast_all_divisions_and_national(history_df: pd.DataFrame, artifacts_dir:
             pred_log = float(np.clip(anc_log + float(est.predict(x_vec)[0]), 0.0, max_cap))
             pred_raw = float(np.clip(np.expm1(pred_log), 0.0, None))
 
+            # Stabilized GJR-GARCH(1,1) conditional volatility (blended with recent 28d vol)
             gp = art["garch_by_div"][div]
-            persist = gp["alpha"] + 0.5 * gp["gamma"] + gp["beta"]
-            var_h = gp["uncond_var"] + (persist ** max(h - 1, 0)) * (gp["init_var"] - gp["uncond_var"])
-            sig_h = float(np.sqrt(np.clip(var_h, 1e-4, 4.0)))
-            nu = gp["nu"]
-            t_q = student_t.ppf(QUANTILES, df=nu) * np.sqrt((nu - 2.0) / nu)
-            q_raw = np.sort(np.clip(np.expm1(np.clip(pred_log + sig_h * t_q, 0.0, max_cap + 1.5)), 0.0, None))
+            persist = float(np.clip(gp["alpha"] + 0.5 * gp["gamma"] + gp["beta"], 0.0, 0.92))
+            uncond_v = float(np.clip(gp["uncond_var"], 1e-4, 0.35))
+            init_v = float(np.clip(gp["init_var"], 1e-4, 0.35))
+            garch_sig = float(np.sqrt(uncond_v + (persist ** max(h - 1, 0)) * (init_v - uncond_v)))
+
+            # Scale smoothly with horizon & dampen log-scale variance at high counts
+            blended_sig = 0.65 * garch_sig + 0.35 * min(recent_vol, 0.45)
+            level_damp = 1.0 / np.sqrt(1.0 + 0.16 * pred_log)
+            horizon_scale = np.sqrt(0.55 + 0.065 * h)
+            max_sig_h = 0.17 + 0.017 * h  # h=1: <=0.19, h=7: <=0.29, h=14: <=0.41
+            sig_h = float(np.clip(blended_sig * level_damp * horizon_scale, 0.06, max_sig_h))
+
+            # Stabilize tail df >= 8 so extreme 95% Student-t multipliers do not explode under expm1
+            nu_eff = max(float(gp.get("nu", 8.0)), 8.0)
+            t_q = student_t.ppf(QUANTILES, df=nu_eff) * np.sqrt((nu_eff - 2.0) / nu_eff)
+            q_raw = np.sort(np.clip(np.expm1(np.clip(pred_log + sig_h * t_q, 0.0, max_cap + 1.0)), 0.0, None))
 
             rec = {
                 "scope": div, "model": "pooled_lgb_gjr_garch", "horizon": h,
@@ -264,6 +283,7 @@ def forecast_all_divisions_and_national(history_df: pd.DataFrame, artifacts_dir:
             rows.append(rec)
             h_div_preds[div] = rec
 
+        # Coherent Bottom-Up National reconciliation (exact sum + R_train interval aggregation)
         orig_nat = h_div_preds["dhaka"]["origin_date"]
         targ_nat = h_div_preds["dhaka"]["target_date"]
         med_sum = sum(h_div_preds[d]["q500"] for d in DIVISIONS)
