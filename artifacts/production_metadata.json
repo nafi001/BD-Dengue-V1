@@ -1,0 +1,34 @@
+{
+  "production_model": "pooled_lgb_gjr_garch",
+  "national_method": "bottom_up_coherent_sum",
+  "divisions": [
+    "dhaka",
+    "chattogram",
+    "khulna",
+    "rajshahi",
+    "rangpur",
+    "barisal",
+    "sylhet",
+    "mymensingh"
+  ],
+  "horizons": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "train_val_end_date": "2025-09-03",
+  "holdout_test_window": "2025-09-04 to 2026-09-03",
+  "data_start_date": "2022-01-01",
+  "latest_data_date": "2026-09-03"
+}
